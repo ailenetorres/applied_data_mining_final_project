@@ -1,0 +1,285 @@
+---
+title: "Project 1"
+author: "Ailene Torres"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Introduction
+Schools are essential in developing children for their life beyond graduation. Parents understandably want to send their children to the best schools. The New York City Department of Education reviews schools annually in order to determine if schools are meeting set targets about student achievement and such. These reports are important for the schools to determine what factors impact their ability to meet student achievement targets. By understanding these factors, these schools can make necessary changes to improve the school's performance. In this analysis, I will attempt to provide some insight into the student achievement targets using data from the NYC Open Data Portal. I have used two specific data sets for my analysis. The first data set provides information on every DOE high school's Regents Exam results. The second data set provides information on the quality report that the DOE releases every year about each school. This data set includes information about which targets each school has met and the student/faculty demographics of each school. Using these data sets, I'll attempt to fit a model that predicts and explains meeting student achievement targets.
+
+
+### Setup and Feature Engineering
+
+#### Libraries
+Here are the libraries I will use in this analysis:
+```{r}
+tinytex::install_tinytex()
+library(tidyverse)
+library(lubridate)
+library(corrplot)
+library(ggpubr)
+library(RColorBrewer)
+library(forcats)
+library(caret)
+
+```
+
+#### Reading in the data
+I first read in the data and explore the features. Seeing how the features are labeled, we rename them into lower case, underline-separated words in order to have the same column name pattern in each data set.
+
+In Excel, I added a `year` feature to each QR data set to indicate which year of data it contains.
+```{r, message = F}
+regents <- read_csv("regents_scores_revert.csv")
+qr_2017_2018 <- read_csv("2017_2018_QR_revert.csv")
+qr_2016_2017 <- read_csv("2016_2017_QR_Results.csv")
+qr_2015_2016 <- read_csv("2015_2016_QR_Results.csv")
+qr_2014_2015 <- read_csv("2014_2015_QR_Results.csv")
+
+## cleaning the column names for aesthetics
+colnames(regents) <- tolower(colnames(regents)) %>%
+gsub(" ", "_", .)
+
+colnames(qr_2014_2015) <- tolower(colnames(qr_2014_2015)) %>%
+gsub(" ", "_", .)
+
+colnames(qr_2015_2016) <- tolower(colnames(qr_2015_2016)) %>%
+gsub(" ", "_", .)
+
+colnames(qr_2016_2017) <- tolower(colnames(qr_2016_2017)) %>%
+gsub(" ", "_", .)
+
+colnames(qr_2017_2018) <- tolower(colnames(qr_2017_2018)) %>%
+gsub(" ", "_", .)
+
+qr_2014_2015 <- qr_2014_2015[,-c(18:23)]
+colnames(qr_2014_2015)[24] <- "percent_in_temp_housing"
+
+qr_2015_2016 <- qr_2015_2016[,-c(18:23,30)]
+
+qr_2016_2017 <- qr_2016_2017[,-c(18:28,35)]
+
+qr_2017_2018 <- qr_2017_2018[,-c(24)]
+
+lst <- list(qr_2014_2015, qr_2015_2016, qr_2016_2017, qr_2017_2018)
+quality_report <- Reduce(function(x,y) merge(x,y,all=TRUE), lst)
+
+unique(quality_report$student_achievement_rating)
+
+```
+#### Exploratory Data Analysis
+We will first gain some insights on the two data sets to see what we're working with.
+```{r}
+str(regents)
+```
+We see that the regents data set is composed of 33,031 rows and 15 columns. The data looks to spread out amongst multiple years and grade levels. 
+
+```{r}
+str(quality_report)
+```
+We can see the quality_report data set is composed of 416 rows and 29 columns.
+
+#### Student Achievement Targets
+Targets are a great way for schools to see how they are performing when it comes to student achievement. Student achievement is an overall rating for student test results, graduation rates, attendance, etc. Using the `student_achievement_rating` feature, we can see how schools are performing. The NA values will be removed before the model is created.
+
+```{r}
+## Converting "Not Meeting Target" into 0, "Approaching Target" into 1, "Meeting Target" into 2, and "Exceeding Target" into 3 for better visualization.
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 'Not Meeting Target'] <- 0
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 'Approaching Target'] <- 1
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 'Meeting Target'] <- 2
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 'Exceeding Target'] <- 3
+
+barplot(table(quality_report$student_achievement_rating), main="Student Achievement Rating",
+        xlab = "Target Performance", ylab = "Count")
+```
+```{r}
+## Renaming values back to their original state.
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 0] <- 'Not Meeting Target'
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 1] <- 'Approaching Target'
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 2] <- 'Meeting Target'
+quality_report$student_achievement_rating[quality_report$student_achievement_rating == 3] <- 'Exceeding Target'
+```
+
+
+#### Filtering data
+Since we're working with high school data, we need to filter the high school Regents exam scores. We do this because students normally take Regents exams in high school. Both data sets will also be merged into one data set called school.
+
+```{r}
+##filtering out scores from 2018 -- High schools
+scores <- regents %>%
+  filter((year == 2018 | year == 2017 | year == 2016 | year == 2015) & school_level == "High school")
+
+## combining both datasets together
+colnames(scores)[1] <- "dbn"
+school <- merge(quality_report, scores, on = c("dbn", "school_name"))
+
+school[school == "N/A"] <- NA
+```
+
+#### Student Testing Participation
+Not all students take the Regents exam at the same time. They have multiple opportunities to do so within a school year, but only a student's highest score is reported. The number of students who take Regents exams may also impact a school's student achievement rating. So, we engineer a new feature which lists for each Regents exam offered, the share of students who take it. This feature will later be merged back to the original data.
+```{r, message = F}
+## calculating the number of students taking a regents exam relative to the school total enrollment
+total_students <- school %>%
+  group_by(school_name, year) %>%
+  summarise(tested_sum = sum(total_tested, na.rm = T),
+            count = n()) %>%
+  mutate(participation_share = tested_sum / count) %>%
+  select(school_name, year, participation_share)
+
+school <- merge(school, total_students,
+                 on = c("school_name", "year"))
+
+scores <- merge(scores, total_students,
+                 on = c("school_name", "year"))
+
+```
+
+#### Our output variable
+We will now define our ouput variable. For this analysis, we will define student achievement rating using the feature `student_achievement_rating`. Any rating listed as `"Meeting Target"` and `"Exceeding Target"` will be counted as passing, and anything else will not. Since we're only focusing on the `student_achievement_rating` feature, we will also ignore the other ratings and percentages from the data set. Redundant columns will also be filtered out.
+
+```{r}
+## re-coding rating into passing (ceased == 1, other = 0)\
+school <- na.omit(school)
+school$passing <- ifelse((school$student_achievement_rating == "Meeting Target") | (school$student_achievement_rating == "Exceeding Target"), 1, 0) %>%
+  factor()
+
+mean(school$passing == 1)
+
+## removing irrelevant columns as well as redundant columns such as
+## number_ columns (we already have columns with the % values)
+school <- school[,-c(6:11,13:18,40,42,44,46,47)]
+
+## converting character to factor variables
+char_vars <- c("school_name", "year", "dbn", "school_type", "school_level", "regents_exam", "student_achievement_rating")
+for(i in seq_along(char_vars)){
+  school[,char_vars[i]] <- as.factor(school[,char_vars[i]])
+}
+
+
+```
+
+### Correlation between numeric variables
+
+```{r}
+numeric_cols <- school[, sapply(school, is.numeric)]
+pairs_matrix <- cor(numeric_cols, use = "complete.obs")
+#, tl.cex = 0.40, number.cex = 0.15
+corrplot(pairs_matrix, method = "number", tl.cex = 0.25, number.cex = 0.25)
+```
+
+We can see that a few of the enrollment/participation pairs have a positive correlation like `enrollment` and `participation_share`. We also see some positive correlation in some of the demographic features such as the `economic_need_index` and `percent_hra_eligible`. There are also some noticeable negative correlations. For example, the `economic_need_index` feature and the average math and english proficiency features have negative correlations.
+
+### Data Splitting
+To train the models, we employ an 80-20 split of train and test, but we also introduce a new subset to only include exam scores from 2015-2018 high schools.
+
+```{r, warning = F}
+set.seed(1234)
+# Create Training and Testing Data
+school18 <- school %>%
+  select(-dbn, -student_achievement_rating, -school_type, -school_level, -school_name)
+
+split <- sample(1:nrow(school18), 0.8*nrow(school18), replace = F)
+
+train18 <- school18[split,]
+test18 <- school18[-split,]
+
+str(train18)
+```
+
+### Classifier: Logistic Regression
+In this model, we use maximum-likelihood estimation to fit a line in the form f(x) = a + b1*x + b2*z + ..., where P(Y = 1) = logit-1(f(x)).
+
+```{r}
+log_fit <- glm(passing ~ ., data = train18, family = binomial(link = "logit"))
+summary(log_fit)
+
+log_preds <- predict(log_fit, newdata = test18, type = "response")
+
+alpha <- 0.5
+log_preds2 <- ifelse(log_preds > alpha, 1, 0)
+confusionMatrix(factor(log_preds2), test18$passing)
+hist(log_preds2)
+
+```
+
+With an accuracy of ~76%, the model performs slightly better than predicting at random according to the base rate of passing or a non-informative model.
+
+There are two main ways we can tune our model. The first is feature selection-- determining which features are most important-- and the other is tuning the classification hyper-parameter. So instead of classifying an observation as 1 if its predicted probability is >= 50%, we could make our model more confident by lowering the hyperparameter from 50% to 40% (or some other number). For now, I will focus on feature selection.
+
+```{r}
+summary(log_fit)
+```
+
+From the summary, we can see that a few features that are not significant. This includes some of the student demographics and Regents exam percentages. We hope that our model will improve by removing some of these features.
+```{r}
+set.seed(1234)
+# Create new Training and Testing Data
+school18_new <- school18 %>%
+  select(-percent_white, -total_tested, -mean_score, -percent_scoring_65_or_above,
+         -percent_scoring_80_or_above)
+
+split <- sample(1:nrow(school18_new), 0.8*nrow(school18_new), replace = F)
+
+train18_new <- school18_new[split,]
+test18_new <- school18_new[-split,]
+
+str(train18_new)
+```
+
+After removing these features from the data set, we run the logistic regression model again.
+```{r}
+log_fit_new <- glm(passing ~ ., data = train18_new, family = binomial(link = "logit"))
+summary(log_fit_new)
+
+log_preds <- predict(log_fit_new, newdata = test18_new, type = "response")
+
+alpha <- 0.5
+log_preds2_new <- ifelse(log_preds > alpha, 1, 0)
+confusionMatrix(factor(log_preds2_new), test18_new$passing)
+hist(log_preds2_new)
+```
+
+We can remove more features since we didn't observe a change in accuracy.
+```{r}
+set.seed(1234)
+# Create new Training and Testing Data
+school_new <- school18_new %>%
+  select(-average_grade_8_english_proficiency, -percent_in_temp_housing)
+
+split <- sample(1:nrow(school_new), 0.8*nrow(school_new), replace = F)
+
+train_new <- school_new[split,]
+test_new <- school_new[-split,]
+
+str(train_new)
+```
+
+Run the model again.
+```{r}
+log_fit_new <- glm(passing ~ ., data = train_new, family = binomial(link = "logit"))
+summary(log_fit_new)
+
+log_preds <- predict(log_fit_new, newdata = test_new, type = "response")
+
+alpha <- 0.5
+log_preds2_new <- ifelse(log_preds > alpha, 1, 0)
+confusionMatrix(factor(log_preds2_new), test_new$passing)
+hist(log_preds2_new)
+```
+Based on the two iterations of feature selection, we can now assume that the logistic regression model can achieve ~76% accuracy on our data sets.
+
+### Conclusion
+Even though we removed a few features, the model didn't improve from its previous iteration.
+This could mean different things. It can mean that we need to remove more features or that we need a more powerful classifier model. The reason I chose logistic regression is because it's a classic classification model. It's easy to train and easy to tune. With more time, I would have liked to explore other classification models. A lot of iterations went into figuring out which dependent and independent variables worked best with logistic regression. What we can conclude from this model is that there are student demographic and test result features that influence a school's student achievement rating. However, there is no one specific feature that has an immense impact on student achievement ratings.
+
+### Critique
+Group: Edgardo Zelaya and Julia Ulziisaikhan
+
+The motivation for tackling their project was to see if the sentiment makeup of an article can be used to predict whether or not it is political. They used readily available New York Times article and comment data from a Kaggle competition. The data spanned from January to May 2017 and January to April 2018. I believe the mining portion of their project was ‘mining’ either positive, negative, or neutral sentiment from each comment, and then calculating the proportions of comments which had negative sentiment on a given article, and so on. They also engineered a polarization variable from these proportions, in order to capture quantitatively, which articles tended to have a high proportion of negative and positive sentiment and low proportion of neutral sentiment, so that the article attracted ‘polarized’ sentiment. Something I would have done differently would be to include more topics of article categorization. I think that the classification of articles into political and non-political bins can be too subjective, because there may be topics like abortion or reproductive health that may be considered political, but may have not been counted.
